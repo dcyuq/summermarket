@@ -2,3 +2,7 @@ discord.py>=2.7.1
 python-dotenv
 emoji
 tzdata
+qrcode
+pillow
+opencv-python-headless
+numpy
