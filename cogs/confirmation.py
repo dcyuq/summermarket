@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import pathlib
 import re
 import secrets
 
@@ -21,6 +22,8 @@ FORMAT_LIMIT = 2000
 LABEL_LIMIT = 80
 MAX_METHODS = 5
 UPLOAD_TIMEOUT = 60
+QR_DIR = pathlib.Path("qr_images")
+ALLOWED_EXT = (".png", ".jpg", ".jpeg", ".webp")
 
 DEFAULT_CONFIRM_FORMAT = (
     "**order confirmation**\n"
@@ -95,7 +98,27 @@ def new_method(label=None, text=None):
         "button": label or DEFAULT_GCASH_BUTTON,
         "text": text or DEFAULT_GCASH_TEXT,
         "qr": "",
+        "image": "",
+        "dynamic": True,
     }
+
+
+def method_image(method):
+    name = (method.get("image") or "").strip()
+    if not name:
+        return None
+    path = QR_DIR / name
+    return path if path.is_file() else None
+
+
+def drop_image(method):
+    path = method_image(method)
+    if path is not None:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    method["image"] = ""
 
 
 def defaults():
@@ -122,6 +145,8 @@ def migrate(settings):
         method.setdefault("button", DEFAULT_GCASH_BUTTON)
         method.setdefault("text", DEFAULT_GCASH_TEXT)
         method.setdefault("qr", "")
+        method.setdefault("image", "")
+        method.setdefault("dynamic", True)
     return settings
 
 
@@ -312,13 +337,19 @@ class AmountModal(discord.ui.Modal):
             return
 
         payload = (self.method.get("qr") or "").strip()
-        image = None
-        if payload:
+        stored = method_image(self.method)
+        upload = None
+        filename = None
+
+        if self.method.get("dynamic") and payload:
             try:
-                image = qrph.render(qrph.set_amount(payload, amount))
+                upload = qrph.render(qrph.set_amount(payload, amount))
+                filename = "payment_qr.png"
             except qrph.QRError as error:
                 log.warning("qr build failed for method %s: %s", self.method.get("id"), error)
-                image = None
+        elif stored is not None:
+            upload = stored
+            filename = f"payment_qr{stored.suffix}"
 
         view = MethodBox(
             self.method,
@@ -326,25 +357,25 @@ class AmountModal(discord.ui.Modal):
             self.parent.author_id,
             interaction.guild,
             amount,
-            attached=image is not None,
+            filename=filename,
         )
         kwargs = {"view": view, "allowed_mentions": discord.AllowedMentions.none()}
-        if image is not None:
-            kwargs["file"] = discord.File(image, filename="payment_qr.png")
+        if upload is not None:
+            kwargs["file"] = discord.File(upload, filename=filename)
         await interaction.response.send_message(**kwargs)
 
 
 class MethodBox(discord.ui.LayoutView):
-    def __init__(self, method, order, author_id, guild, amount, attached=False):
+    def __init__(self, method, order, author_id, guild, amount, filename=None):
         super().__init__(timeout=None)
         box = discord.ui.Container()
         body = render(method.get("text") or "", order, author_id, guild, amount)
         body, image_url = split_image(body)
         if body.strip():
             box.add_item(discord.ui.TextDisplay(body[:4000]))
-        if attached:
+        if filename:
             gallery = discord.ui.MediaGallery()
-            gallery.add_item(media="attachment://payment_qr.png")
+            gallery.add_item(media=f"attachment://{filename}")
             box.add_item(gallery)
         elif image_url:
             gallery = discord.ui.MediaGallery()
@@ -387,6 +418,7 @@ class MethodPanel(discord.ui.View):
         self.parent = parent
         self.ctx = parent.ctx
         self.method = method
+        self.message = None
 
     async def interaction_check(self, interaction):
         if interaction.user.id == self.ctx.author.id:
@@ -397,18 +429,31 @@ class MethodPanel(discord.ui.View):
         return False
 
     def status_embed(self):
-        qr = "uploaded" if (self.method.get("qr") or "").strip() else "none, text only"
+        payload = (self.method.get("qr") or "").strip()
+        stored = method_image(self.method)
+        dynamic = bool(self.method.get("dynamic"))
+
+        if dynamic and payload:
+            qr = "on, amount baked in per order"
+        elif dynamic:
+            qr = "on, but no readable payload. upload a plain qr or switch off"
+        elif stored is not None:
+            qr = "off, sending your uploaded image as is"
+        else:
+            qr = "off, and nothing uploaded. text only"
+
         lines = [
             "**payment method**",
             "",
             f"**button** : {self.method['button']}",
-            f"**qr** : {qr}",
+            f"**generate qr** : {qr}",
+            f"**uploaded image** : {'yes' if stored is not None else 'none'}",
             "",
             "**text preview**",
             (self.method.get("text") or "")[:800],
             "",
-            "tip : put `{amount}` in the text to show what the buyer typed. "
-            "leave the qr empty and only this text gets sent.",
+            "tip : put `{amount}` in the text to show what the buyer typed. turn generate "
+            "qr off for wallets that reject a rebuilt code, then upload a fixed amount qr.",
         ]
         return embeds.build("\n".join(lines)[:4096])
 
@@ -416,8 +461,12 @@ class MethodPanel(discord.ui.View):
         embed = self.status_embed()
         if interaction is not None and not interaction.response.is_done():
             await interaction.response.edit_message(embed=embed, view=self)
-        elif interaction is not None:
-            await interaction.edit_original_response(embed=embed, view=self)
+            return
+        if self.message is not None:
+            try:
+                await self.message.edit(embed=embed, view=self)
+            except discord.HTTPException:
+                pass
 
     @discord.ui.button(label="button label", style=discord.ButtonStyle.secondary, row=0)
     async def edit_label(self, interaction, button):
@@ -454,29 +503,65 @@ class MethodPanel(discord.ui.View):
             await interaction.followup.send(embed=embeds.error("timed out, nothing saved."), ephemeral=True)
             return
 
-        try:
-            data = await message.attachments[0].read()
-            payload = qrph.read_image(data)
-            qrph.validate(payload)
-        except qrph.QRError as error:
-            await interaction.followup.send(embed=embeds.error(str(error)), ephemeral=True)
+        attachment = message.attachments[0]
+        suffix = pathlib.Path(attachment.filename).suffix.lower()
+        if suffix not in ALLOWED_EXT:
+            await interaction.followup.send(
+                embed=embeds.error("that has to be a png, jpg or webp."), ephemeral=True
+            )
             return
+
+        try:
+            data = await attachment.read()
         except discord.HTTPException:
             await interaction.followup.send(embed=embeds.error("could not download that file."), ephemeral=True)
             return
 
-        self.method["qr"] = payload
+        QR_DIR.mkdir(exist_ok=True)
+        drop_image(self.method)
+        name = f"{self.ctx.guild.id}_{self.method['id']}{suffix}"
+        (QR_DIR / name).write_bytes(data)
+        self.method["image"] = name
+
+        try:
+            payload = qrph.read_image(data)
+            qrph.validate(payload)
+            self.method["qr"] = payload
+            note = "qr saved. generate qr is on, so the amount gets baked in per order."
+        except qrph.QRError as error:
+            self.method["qr"] = ""
+            self.method["dynamic"] = False
+            note = f"image saved, but i could not read a payload from it ({error}) so generate qr is off. it will be sent as is."
+
         save_config()
         try:
             await message.delete()
         except discord.HTTPException:
             pass
-        await interaction.followup.send(embed=embeds.build("qr saved."), ephemeral=True)
+        await interaction.followup.send(embed=embeds.build(note), ephemeral=True)
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="generate qr", style=discord.ButtonStyle.secondary, row=1)
+    async def toggle_dynamic(self, interaction, button):
+        turning_on = not self.method.get("dynamic")
+        if turning_on and not (self.method.get("qr") or "").strip():
+            await interaction.response.send_message(
+                embed=embeds.error(
+                    "no readable payload on this method, so it cannot build a qr. "
+                    "upload a plain qr with no amount on it first."
+                ),
+                ephemeral=True,
+            )
+            return
+        self.method["dynamic"] = turning_on
+        save_config()
         await self.refresh(interaction)
 
     @discord.ui.button(label="clear qr", style=discord.ButtonStyle.secondary, row=1)
     async def clear_qr(self, interaction, button):
         self.method["qr"] = ""
+        self.method["dynamic"] = True
+        drop_image(self.method)
         save_config()
         await self.refresh(interaction)
 
@@ -520,6 +605,7 @@ class MethodSelect(discord.ui.Select):
         await interaction.response.send_message(
             embed=view.status_embed(), view=view, ephemeral=True
         )
+        view.message = await interaction.original_response()
 
 
 class SetupView(discord.ui.View):
